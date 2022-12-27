@@ -18,6 +18,5 @@ pub async fn main_worker() -> Result<(), JsValue> {
     let _producer = Producer {}.produce(transport, Configuration::default());
     console_log!("Worker: transport open and producing.");
 
-
     Ok(())
 }
