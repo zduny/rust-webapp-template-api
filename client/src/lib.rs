@@ -1,18 +1,16 @@
-use std::{cell::RefCell, rc::Rc};
+use std::rc::Rc;
 
-use common::message::{
-    client, server,
-    worker::{self, host},
-};
-use futures::{SinkExt, StreamExt};
+use common::api::{self, chat::Api as ChatApi, worker::Api as WorkerApi};
+use futures::StreamExt;
 use kodec::binary::Codec;
 use wasm_bindgen::{prelude::*, JsCast};
 
 use js_utils::{console_log, document, event::When, set_panic_hook, spawn, window};
-use mezzenger::{Messages, Receive};
 use web_sys::{
     HtmlInputElement, HtmlTextAreaElement, KeyboardEvent, MouseEvent, WebSocket, Worker,
 };
+
+use zzrpc::consumer::{Configuration, Consume};
 
 #[wasm_bindgen(start)]
 pub async fn main_client() -> Result<(), JsValue> {
@@ -48,49 +46,20 @@ pub async fn main_client() -> Result<(), JsValue> {
         .expect("couldn't extract host from location");
     let url = format!("ws://{host}/ws");
     let web_socket = Rc::new(WebSocket::new(&url).unwrap());
-    let (web_socket_sender, mut web_socket_receiver) = mezzenger_websocket::Transport::<
-        Codec,
-        server::Message,
-        client::Message,
-    >::new(&web_socket, Codec::default())
-    .await
-    .unwrap()
-    .split();
-    let web_socket_sender = Rc::new(RefCell::new(web_socket_sender));
+    let transport = mezzenger_websocket::Transport::new(&web_socket, Codec::default())
+        .await
+        .unwrap();
+    let chat_consumer = api::chat::Consumer::consume(transport, Configuration::default());
+    let chat_consumer = Rc::new(chat_consumer);
     write_line("Connected.");
 
     // setting up worker
     let worker = Rc::new(Worker::new("./worker.js").unwrap());
-    let (worker_sender, worker_receiver) =
-        mezzenger_webworker::Transport::<_, Codec, worker::Message, host::Message>::new(
-            &worker,
-            Codec::default(),
-        )
+    let transport = mezzenger_webworker::Transport::new(&worker, Codec::default())
         .await
-        .unwrap()
-        .split();
-    let worker_sender = Rc::new(RefCell::new(worker_sender));
-
-    // handle worker messages
-    let write_line_clone = write_line.clone();
-    let mut message_stream = worker_receiver.messages_with_error_callback(move |error| {
-        write_line_clone(&format!(
-            "Error occurred while receiving message from worker: {error}."
-        ));
-    });
-    let write_line_clone = write_line.clone();
-    spawn(async move {
-        while let Some(message) = message_stream.next().await {
-            match message {
-                worker::Message::ResultFactorial { input, output } => {
-                    write_line_clone(&format!("{input}! = {output}"));
-                }
-                worker::Message::ResultFibonacci { input, output } => {
-                    write_line_clone(&format!("fibonacci({input}) = {output}"));
-                }
-            }
-        }
-    });
+        .unwrap();
+    let worker_consumer = api::worker::Consumer::consume(transport, Configuration::default());
+    let worker_consumer = Rc::new(worker_consumer);
 
     // setting up event handlers
     let input = Rc::new(
@@ -110,19 +79,16 @@ pub async fn main_client() -> Result<(), JsValue> {
     );
 
     let input_clone = input.clone();
+    let chat_consumer_clone = chat_consumer.clone();
     let write_line_clone = write_line.clone();
     let send = move || {
         let text = input_clone.value().trim().to_string();
-        let web_socket_sender = web_socket_sender.clone();
+        let chat_consumer = chat_consumer_clone.clone();
         let write_line_clone = write_line_clone.clone();
         spawn(async move {
-            let mut sender = web_socket_sender.borrow_mut();
-            match sender.send(client::Message { content: text }).await {
-                Ok(_) => (),
-                Err(error) => {
-                    write_line_clone(&format!("Error occurred while sending message: {error}."));
-                }
-            };
+            let _ = chat_consumer.message(text).await.map_err(|error| {
+                write_line_clone(&format!("Error occurred while sending message: {error}."));
+            });
         });
         input_clone.set_value("");
     };
@@ -155,22 +121,23 @@ pub async fn main_client() -> Result<(), JsValue> {
 
     let get_input_clone = get_input.clone();
     let write_line_clone = write_line.clone();
-    let worker_sender_clone = worker_sender.clone();
+    let worker_consumer_clone = worker_consumer.clone();
     let _fibonacci_handler = Rc::new(document.get_element_by_id("fibonacci").unwrap())
         .when("click", move |_event: MouseEvent| {
             if let Some(input) = get_input_clone() {
                 write_line_clone(&format!("Calculating fibonacci({input})..."));
-                let worker_sender_clone = worker_sender_clone.clone();
+                let worker_consumer_clone = worker_consumer_clone.clone();
                 let write_line_clone = write_line_clone.clone();
                 spawn(async move {
-                    if let Err(error) = worker_sender_clone
-                        .borrow_mut()
-                        .send(host::Message::CalculateFibonacci { input })
-                        .await
-                    {
-                        write_line_clone(&format!(
-                            "Error occurred while sending message to worker: {error}."
-                        ));
+                    match worker_consumer_clone.fibonacci(input).await {
+                        Ok(result) => {
+                            write_line_clone(&format!("fibonacci({input}) = {result}"));
+                        }
+                        Err(error) => {
+                            write_line_clone(&format!(
+                                "Error occurred while sending message to worker: {error}."
+                            ));
+                        }
                     }
                 });
             }
@@ -181,18 +148,19 @@ pub async fn main_client() -> Result<(), JsValue> {
     let _factorial_handler = Rc::new(document.get_element_by_id("factorial").unwrap())
         .when("click", move |_event: MouseEvent| {
             if let Some(input) = get_input() {
-                let worker_sender_clone = worker_sender.clone();
+                let worker_consumer_clone = worker_consumer.clone();
                 let write_line_clone = write_line_clone.clone();
                 write_line_clone(&format!("Calculating {input}!..."));
                 spawn(async move {
-                    if let Err(error) = worker_sender_clone
-                        .borrow_mut()
-                        .send(host::Message::CalculateFactorial { input })
-                        .await
-                    {
-                        write_line_clone(&format!(
-                            "Error occurred while sending message to worker: {error}."
-                        ));
+                    match worker_consumer_clone.factorial(input).await {
+                        Ok(result) => {
+                            write_line_clone(&format!("{input}! = {result}"));
+                        }
+                        Err(error) => {
+                            write_line_clone(&format!(
+                                "Error occurred while sending message to worker: {error}."
+                            ));
+                        }
                     }
                 });
             }
@@ -200,49 +168,41 @@ pub async fn main_client() -> Result<(), JsValue> {
         .unwrap();
 
     // handle server messages
-    let init_message = web_socket_receiver.receive().await.unwrap();
-    match init_message {
-        server::Message::Init {
-            user_name,
-            connected_user_names,
-        } => {
-            write_line(&format!("Your name: <{user_name}>."));
-
-            if !connected_user_names.is_empty() {
-                write_line(&format!(
-                    "Other connected users: {}.",
-                    connected_user_names
-                        .iter()
-                        .map(|user| format!("<{user}>"))
-                        .collect::<Vec<String>>()
-                        .join(", ")
-                ));
-            }
-        }
-        _ => panic!("unexpected message received"),
+    let user_name = chat_consumer.user_name().await.unwrap();
+    let connected_user_names = chat_consumer.user_names().await.unwrap();
+    write_line(&format!("Your name: <{user_name}>."));
+    if !connected_user_names.is_empty() {
+        write_line(&format!(
+            "Other connected users: {}.",
+            connected_user_names
+                .iter()
+                .map(|user| format!("<{user}>"))
+                .collect::<Vec<String>>()
+                .join(", ")
+        ));
     }
 
     let write_line_clone = write_line.clone();
-    let mut message_stream = web_socket_receiver.messages_with_error_callback(move |error| {
-        write_line_clone(&format!(
-            "Error occurred while receiving message from web socket: {error}."
-        ));
+    let mut connected = chat_consumer.connected().await.unwrap();
+    spawn(async move {
+        while let Some(user_name) = connected.next().await {
+            write_line_clone(&format!("New user connected: <{user_name}>."));
+        }
     });
 
-    while let Some(message) = message_stream.next().await {
-        match message {
-            server::Message::UserConnected { user_name } => {
-                write_line(&format!("New user connected: <{user_name}>."));
-            }
-            server::Message::UserDisconnected { user_name } => {
-                write_line(&format!("User <{user_name}> left."));
-            }
-            server::Message::Message { user_name, content } => {
-                write_line(&format!("<{user_name}> {content}"));
-            }
-            _ => panic!("unexpected message received"),
+    let write_line_clone = write_line.clone();
+    let mut disconnected = chat_consumer.disconnected().await.unwrap();
+    spawn(async move {
+        while let Some(user_name) = disconnected.next().await {
+            write_line_clone(&format!("User <{user_name}> left."));
         }
+    });
+
+    let mut messages = chat_consumer.messages().await.unwrap();
+    while let Some((user_name, message)) = messages.next().await {
+        write_line(&format!("<{user_name}> {message}"));
     }
+
     write_line("Server disconnected.");
 
     Ok(())

@@ -1,10 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
-use common::message::{client, server};
-use futures::{select, FutureExt, SinkExt, StreamExt};
+use futures::{select, FutureExt, StreamExt};
 use kodec::binary::Codec;
 use lazy_static::lazy_static;
-use mezzenger::{Messages, Receive};
 use mezzenger_websocket::Transport;
 use regex::{Captures, Regex};
 use rustyline_async::{Readline, ReadlineError, SharedWriter};
@@ -12,6 +10,9 @@ use std::io::Write;
 use tokio::spawn;
 use tokio_tungstenite::connect_async;
 use url::Url;
+
+use common::api::chat::{Api, Consumer};
+use zzrpc::consumer::{Configuration, Consume};
 
 lazy_static! {
     static ref FIBONACCI_PATTERN: Regex = Regex::new(r"^fibonacci\((0|[1-9][0-9]*)\)$").unwrap();
@@ -36,30 +37,23 @@ async fn main() -> Result<()> {
     let url = Url::parse(&args.url)?;
     let (web_socket, _) = connect_async(url).await?;
     let codec = Codec::default();
-    let (mut sender, mut receiver) =
-        Transport::<_, Codec, server::Message, client::Message>::new(web_socket, codec).split();
+    let transport = Transport::new(web_socket, codec);
+    let consumer = Consumer::consume(transport, Configuration::default());
     println!("Connected.");
 
-    let init_message = receiver.receive().await?;
-    match init_message {
-        server::Message::Init {
-            user_name,
-            connected_user_names,
-        } => {
-            println!("Your name: <{user_name}>.");
+    let user_name = consumer.user_name().await.unwrap();
+    let connected_user_names = consumer.user_names().await.unwrap();
+    println!("Your name: <{user_name}>.");
 
-            if !connected_user_names.is_empty() {
-                println!(
-                    "Other connected users: {}.",
-                    connected_user_names
-                        .iter()
-                        .map(|user| format!("<{user}>"))
-                        .collect::<Vec<String>>()
-                        .join(", ")
-                );
-            }
-        }
-        _ => panic!("unexpected message received"),
+    if !connected_user_names.is_empty() {
+        println!(
+            "Other connected users: {}.",
+            connected_user_names
+                .iter()
+                .map(|user| format!("<{user}>"))
+                .collect::<Vec<String>>()
+                .join(", ")
+        );
     }
 
     let (mut readline, mut stdout) = Readline::new("> ".to_string())?;
@@ -71,34 +65,29 @@ async fn main() -> Result<()> {
     writeln!(stdout, "Type 'n!' to calculate factorial on n.")?;
 
     {
-        let mut stdout_clone = stdout.clone();
-        let mut message_stream = receiver.messages_with_error_callback(move |error| {
-            let _ = writeln!(
-                stdout_clone,
-                "Error occurred while receiving message: {error}."
-            );
-        });
+        let mut messages = consumer.messages().await.unwrap();
+        let mut connected = consumer.connected().await.unwrap();
+        let mut disconnected = consumer.disconnected().await.unwrap();
 
         loop {
             select! {
-                message = message_stream.next() => {
-                    if let Some(message) = message {
-                        match message {
-                            server::Message::UserConnected { user_name } => {
-                                writeln!(stdout, "New user connected: <{user_name}>.")?;
-                            },
-                            server::Message::UserDisconnected { user_name } => {
-                                writeln!(stdout, "User <{user_name}> left.")?;
-                            },
-                            server::Message::Message { user_name, content } => {
-                                writeln!(stdout, "<{user_name}> {content}")?;
-                            },
-                            _ => panic!("unexpected message received"),
-                        }
+                message = messages.next() => {
+                    if let Some((user_name, message)) = message {
+                        writeln!(stdout, "<{user_name}> {message}")?;
                     } else {
                         writeln!(stdout, "Server disconnected.")?;
                         writeln!(stdout, "Exiting...")?;
                         break;
+                    }
+                },
+                connected = connected.next() => {
+                    if let Some(user_name) = connected {
+                        writeln!(stdout, "New user connected: <{user_name}>.")?;
+                    }
+                },
+                disconnected = disconnected.next() => {
+                    if let Some(user_name) = disconnected {
+                        writeln!(stdout, "User <{user_name}> left.")?;
                     }
                 },
                 command = readline.readline().fuse() => match command {
@@ -123,8 +112,7 @@ async fn main() -> Result<()> {
                                 writeln!(stdout, "Error: {input} is not a non-negative integer.")?;
                             }
                         } else {
-                            let message = client::Message { content: line.to_string() };
-                            sender.send(message).await?;
+                            consumer.message(line.to_string()).await.unwrap();
                         }
                     },
                     Err(ReadlineError::Eof | ReadlineError::Interrupted) => {

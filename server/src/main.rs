@@ -3,24 +3,24 @@ mod state;
 use std::{env::current_dir, sync::Arc};
 
 use anyhow::Result;
-use common::message::{client, server};
-use futures::{SinkExt, StreamExt};
+use futures::Stream;
 use kodec::binary::Codec;
 use mezzenger_websocket::warp::Transport;
 use tokio::{
     signal::ctrl_c,
     spawn,
-    sync::{mpsc::unbounded_channel, RwLock},
+    sync::RwLock,
 };
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::{
+    wrappers::BroadcastStream,
+    StreamExt,
+};
 use tracing::{error, info, Level};
 use warp::{
     hyper::StatusCode,
     ws::{WebSocket, Ws},
     Filter,
 };
-
-use crate::state::User;
 
 type State = Arc<RwLock<state::State>>;
 
@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
     let current_dir = current_dir()?;
     info!("Current working directory: {:?}.", current_dir);
 
-    let state = State::default();
+    let state = Arc::new(RwLock::new(state::State::new()));
     let state = warp::any().map(move || state.clone());
     let websocket = warp::path("ws")
         .and(warp::ws())
@@ -58,87 +58,97 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn user_connected(web_socket: WebSocket, state: State) {
-    let codec = Codec::default();
-    let (mut sender, mut receiver) =
-        Transport::<_, Codec, client::Message, server::Message>::new(web_socket, codec).split();
+use common::api::chat::*;
+use zzrpc::{
+    producer::{Configuration, Produce},
+    Produce,
+};
 
-    let (user_sender, user_receiver) = unbounded_channel();
-    let mut user_receiver = UnboundedReceiverStream::new(user_receiver);
+#[derive(Produce)]
+struct Producer {
+    state: State,
+    user_name: String,
+}
 
-    let user = User::new(user_sender);
-    let id = user.id;
-    let name = user.name.clone();
+impl Producer {
+    /// Get user name.
+    async fn user_name(&self) -> String {
+        self.user_name.clone()
+    }
 
-    let connected_user_names = state
-        .read()
-        .await
-        .users
-        .values()
-        .map(|user| user.name.clone())
-        .collect();
-    let init_message = server::Message::Init {
-        user_name: name.clone(),
-        connected_user_names,
-    };
-    if sender.send(init_message).await.is_ok() {
-        info!("User <{name}> connected.");
-        let message = server::Message::UserConnected {
-            user_name: name.clone(),
-        };
-        for (&user_id, user) in state.read().await.users.iter() {
-            if id != user_id {
-                let _ = user.sender.send(message.clone());
-            }
-        }
+    /// Get other connected user names.
+    async fn user_names(&self) -> Vec<String> {
+        let my_name = self.user_name.clone();
+        self.state
+            .read()
+            .await
+            .users
+            .values()
+            .map(|user| &user.name)
+            .filter(move |name| name != &&my_name)
+            .cloned()
+            .collect()
+    }
 
-        spawn(async move {
-            while let Some(message) = user_receiver.next().await {
-                let result = sender.send(message).await;
-                if let Err(error) = result {
-                    error!("Failed to send message to user: id: {id}, error: {error}.");
-                }
-            }
-        });
+    /// Send chat message.
+    async fn message(&self, message: String) {
+        let _ = self
+            .state
+            .read()
+            .await
+            .message_sender
+            .send((self.user_name.clone(), message));
+    }
 
-        state.write().await.users.insert(id, user);
+    /// Stream of pairs containing: (user name, message)
+    async fn messages(&self) -> impl Stream<Item = (String, String)> {
+        BroadcastStream::new(self.state.read().await.message_sender.subscribe())
+            .filter_map(Result::ok)
+    }
 
-        while let Some(result) = receiver.next().await {
-            let msg = match result {
-                Ok(msg) => msg,
-                Err(error) => {
-                    error!("Failed to receive message from user: id: {id}, error: {error}.");
-                    break;
-                }
-            };
-            user_message(id, name.clone(), msg, &state).await;
-        }
+    /// Stream of names of newly connected users.
+    async fn connected(&self) -> impl Stream<Item = String> {
+        let my_name = self.user_name.clone();
+        BroadcastStream::new(self.state.read().await.connected_sender.subscribe())
+            .filter_map(Result::ok)
+            .filter(move |name| name != &my_name)
+    }
 
-        user_disconnected(id, name, &state).await;
+    /// Stream of names of disconnected users.
+    async fn disconnected(&self) -> impl Stream<Item = String> {
+        let my_name = self.user_name.clone();
+        BroadcastStream::new(self.state.read().await.disconnected_sender.subscribe())
+            .filter_map(Result::ok)
+            .filter(move |name| name != &my_name)
     }
 }
 
-async fn user_message(_id: usize, name: String, message: client::Message, state: &State) {
-    let message = server::Message::Message {
-        user_name: name,
-        content: message.content,
+async fn user_connected(web_socket: WebSocket, state: State) {
+    let codec = Codec::default();
+    let transport = Transport::new(web_socket, codec);
+    let (id, name) = {
+        let mut state_lock = state.write().await;
+        let user = state_lock.add_user();
+        (user.id, user.name.clone())
     };
-    for user in state.read().await.users.values() {
-        let _ = user.sender.send(message.clone());
-    }
+    info!("User <{name}> connected.");
+    let producer = Producer {
+        state: state.clone(),
+        user_name: name.clone(),
+    };
+    producer
+        .produce(transport, Configuration::default())
+        .await
+        .unwrap();
+
+    user_disconnected(id, name, &state).await;
 }
 
 async fn user_disconnected(id: usize, name: String, state: &State) {
     info!("User <{name}> disconnected.");
-
-    let message = server::Message::UserDisconnected { user_name: name };
-    for (&user_id, user) in state.read().await.users.iter() {
-        if id != user_id {
-            let _ = user.sender.send(message.clone());
-        }
-    }
-
-    state.write().await.users.remove(&id);
+    let mut state = state.write().await;
+    state.users.remove(&id);
+    let _ = state.disconnected_sender.send(name);
 }
 
 async fn handle_rejection(

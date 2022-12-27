@@ -1,4 +1,5 @@
 pub mod message;
+pub mod api;
 
 use std::mem::replace;
 

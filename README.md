@@ -1,6 +1,6 @@
 # {{project-name}}
 
-Rust web application template.
+Rust web application template using [zzrpc](https://github.com/zduny/zzrpc) api.
 
 Implements a simple chat application.
 
@@ -21,7 +21,7 @@ To build the app [wasm-pack](https://rustwasm.github.io/wasm-pack) needs to be i
 Use [cargo-generate](https://github.com/cargo-generate/cargo-generate):
 
 ```bash
-cargo generate --git https://github.com/zduny/rust-webapp-template
+cargo generate --git https://github.com/zduny/rust-webapp-template-api
 ```
 
 ## To template users
@@ -68,6 +68,8 @@ This template uses following Rust crates developed by [me](https://github.com/zd
 - [mezzenger](https://github.com/zduny/mezzenger) - message passing infrastructure for Rust.
 
 - [kodec](https://github.com/zduny/kodec) - message encoding/decoding interface.
+
+- [zzrpc](https://github.com/zduny/zzrpc) - RPC over `mezzenger` transports.
 
 Please consider donating to support their further development:
 
