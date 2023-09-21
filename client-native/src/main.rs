@@ -18,6 +18,7 @@ lazy_static! {
     static ref FIBONACCI_PATTERN: Regex = Regex::new(r"^fibonacci\((0|[1-9][0-9]*)\)$").unwrap();
     static ref FACTORIAL_PATTERN: Regex = Regex::new(r"^(0|[1-9][0-9]*)!$").unwrap();
 }
+
 /// Web app native client
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
