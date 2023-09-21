@@ -6,15 +6,8 @@ use anyhow::Result;
 use futures::Stream;
 use kodec::binary::Codec;
 use mezzenger_websocket::warp::Transport;
-use tokio::{
-    signal::ctrl_c,
-    spawn,
-    sync::RwLock,
-};
-use tokio_stream::{
-    wrappers::BroadcastStream,
-    StreamExt,
-};
+use tokio::{signal::ctrl_c, spawn, sync::RwLock};
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tracing::{error, info, Level};
 use warp::{
     hyper::StatusCode,
