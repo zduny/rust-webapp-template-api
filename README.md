@@ -1,5 +1,7 @@
 # {{project-name}}
 
+[![Test Status](https://github.com/zduny/rust-webapp-template-api/actions/workflows/rust.yml/badge.svg)](https://github.com/zduny/rust-webapp-template-api/actions)
+
 Rust web application template using [zzrpc](https://github.com/zduny/zzrpc) api.
 
 Implements a simple chat application.
